@@ -160,6 +160,7 @@
   <button data-tab="transactions">Transactions</button>
   <button data-tab="reviews">Reviews</button>
   <button data-tab="staff">Staff</button>
+  <button data-tab="insights">Insights</button>
 </nav>
 
 <main>
@@ -342,6 +343,22 @@
     </table>
   </section>
 
+  <!-- INSIGHTS (AI review digest) -->
+  <section id="tab-insights" class="tab">
+    <div class="filters">
+      <label>Shop
+        <select id="ins-shop">
+          <option value="">All shops</option>
+        </select>
+      </label>
+      <label>From <input type="date" id="ins-from"></label>
+      <label>To <input type="date" id="ins-to"></label>
+      <button onclick="loadInsights()">Generate digest</button>
+      <button class="secondary" onclick="resetFilters('insights')">Reset</button>
+    </div>
+    <div id="ins-body"><div class="muted">Pick a period and generate a digest.</div></div>
+  </section>
+
 </main>
 
 <script>
@@ -394,6 +411,7 @@ document.querySelectorAll('nav button').forEach(btn => {
     else if (tab === 'transactions') loadTransactions(0);
     else if (tab === 'reviews') loadReviews(0);
     else if (tab === 'staff') loadStaff();
+    else if (tab === 'insights') loadInsights();
   });
 });
 
@@ -424,6 +442,7 @@ function resetFilters(prefix) {
   if (prefix === 'tx') loadTransactions(0);
   if (prefix === 'rv') loadReviews(0);
   if (prefix === 'staff') loadStaff();
+  if (prefix === 'insights') loadInsights();
 }
 
 // ---- SHOPS tab ----
@@ -593,6 +612,77 @@ async function loadStaff() {
   } catch (e) {
     body.innerHTML = `<tr><td colspan="6" class="error">${esc(e.message)}</td></tr>`;
   }
+}
+
+// ---- INSIGHTS tab (AI review digest) ----
+async function loadInsights() {
+  const body = document.getElementById('ins-body');
+  body.innerHTML = '<div class="loading">Generating digest (this calls the LLM and can take a few seconds)...</div>';
+  try {
+    const data = await api('/api/insights/review-digest', {
+      shop_id: document.getElementById('ins-shop').value,
+      date_from: document.getElementById('ins-from').value,
+      date_to: document.getElementById('ins-to').value,
+    });
+    renderInsights(data);
+  } catch (e) {
+    body.innerHTML = `<div class="error">${esc(e.message)}</div>`;
+  }
+}
+
+function renderInsights(data) {
+  const body = document.getElementById('ins-body');
+  const period = data.period || {};
+  const stats = period.stats || {};
+  const prev = period.previous_stats || {};
+  let html = `<div class="review">
+    <div class="meta">
+      <span>Period: ${esc(period.from || '?')} → ${esc(period.to || '?')}</span>
+      <span>${stats.review_count ?? 0} reviews</span>
+      <span>avg ★ ${stats.avg_rating ?? '—'}</span>
+      <span>previous period: ${prev.review_count ?? 0} reviews, avg ★ ${prev.avg_rating ?? '—'}</span>
+      ${period.input_truncated ? '<span>input truncated to most recent</span>' : ''}
+    </div>`;
+
+  if (data.degraded || !data.digest) {
+    html += `<div class="text"><b>AI digest unavailable.</b> ${esc(data.reason || '')}</div>`;
+    if (data.validation_notes && data.validation_notes.length) {
+      html += `<div class="meta" style="margin-top:6px">${data.validation_notes.map(n => esc(n)).join(' · ')}</div>`;
+    }
+    html += `</div>`;
+    body.innerHTML = html;
+    return;
+  }
+
+  const d = data.digest;
+  html += `<div class="text"><b>Sentiment: ${esc(d.overall_sentiment)}</b> — ${esc(d.summary)}</div>`;
+  if (d.themes && d.themes.length) {
+    html += `<table style="margin-top:10px"><thead><tr>
+      <th>Theme</th><th>Severity</th><th>Sentiment</th><th>Evidence</th><th>Explanation</th>
+    </tr></thead><tbody>`;
+    html += d.themes.map(t => `
+      <tr>
+        <td>${esc(t.title || t.theme)}</td>
+        <td class="rating-${t.severity === 'high' ? 1 : t.severity === 'medium' ? 3 : 4}">${esc(t.severity)}</td>
+        <td>${esc(t.sentiment)}</td>
+        <td>${esc((t.evidence || []).join(' | '))}<br>
+            <span class="muted">review ids: ${esc((t.review_ids || []).join(', '))}</span></td>
+        <td>${esc(t.explanation)}</td>
+      </tr>`).join('');
+    html += `</tbody></table>`;
+  } else {
+    html += `<div class="text" style="margin-top:8px">No recurring themes found for this period.</div>`;
+  }
+  if (d.recommended_actions && d.recommended_actions.length) {
+    html += `<div class="text" style="margin-top:10px"><b>Recommended actions</b><ul style="margin:6px 0 0 18px">`
+      + d.recommended_actions.map(a => `<li>${esc(a)}</li>`).join('') + `</ul></div>`;
+  }
+  if (data.validation_notes && data.validation_notes.length) {
+    html += `<div class="meta" style="margin-top:8px"><b>Validation notes:</b> ${data.validation_notes.map(n => esc(n)).join(' · ')}</div>`;
+  }
+  html += `<div class="meta" style="margin-top:8px">prompt: ${esc(data.prompt_version)} · model: ${esc(data.model)}</div>`;
+  html += `</div>`;
+  body.innerHTML = html;
 }
 
 function shopName(id) {
