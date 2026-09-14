@@ -2,10 +2,15 @@
 
 No AI, no summaries, no forecasts. Raw data only.
 Candidates are expected to identify where AI adds value and implement it.
+
+The one AI feature (review theme digest) lives in the `ai/` package and is
+mounted at /api/insights/review-digest.
 """
 
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -342,6 +347,89 @@ def stats_barista(
         params,
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# AI: review theme digest (see DISCOVERY.md, ai/prompts/review_digest_v1.md)
+# ---------------------------------------------------------------------------
+
+from ai import digest as ai_digest
+from ai import providers as ai_providers
+
+DIGEST_CACHE_TTL_SECONDS = 15 * 60
+_digest_cache: dict = {}
+_digest_cache_lock = threading.Lock()
+_provider: "ai_providers.LLMProvider | None" = None
+_provider_lock = threading.Lock()
+
+
+def _get_provider() -> "ai_providers.LLMProvider":
+    """Lazily build the LLM provider once; re-read env each app start only."""
+    global _provider
+    with _provider_lock:
+        if _provider is None:
+            _provider = ai_providers.get_provider()
+        return _provider
+
+
+@app.get("/api/insights/review-digest")
+def review_digest(
+    shop_id: Optional[int] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    refresh: bool = False,
+    conn=Depends(get_conn),
+):
+    """LLM digest of review themes for one shop (or all) over a period.
+
+    Deterministic stats are always returned. If the LLM call succeeds, `digest`
+    contains the structured themes; otherwise the response is degraded
+    (digest=null, reason set) and the UI shows the stats with a note.
+    """
+    provider = _get_provider()
+    prompt_version = ai_digest.load_prompt()["version"]
+    cache_key = (shop_id, date_from, date_to, prompt_version)
+
+    if shop_id is not None and not conn.execute(
+        "SELECT 1 FROM shops WHERE id = ?", (shop_id,)
+    ).fetchone():
+        raise HTTPException(status_code=404, detail=f"shop {shop_id} not found")
+
+    if not refresh:
+        with _digest_cache_lock:
+            hit = _digest_cache.get(cache_key)
+        if hit and hit["expires"] > time.time():
+            return hit["payload"]
+
+    try:
+        result = ai_digest.generate_digest(
+            conn, provider, shop_id=shop_id,
+            date_from=date_from, date_to=date_to,
+        )
+    except ai_digest.DigestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    payload = {
+        "shop_id": shop_id,
+        "period": result_context_period(conn, shop_id, date_from, date_to),
+        **result.to_response(),
+    }
+    with _digest_cache_lock:
+        _digest_cache[cache_key] = {
+            "expires": time.time() + DIGEST_CACHE_TTL_SECONDS,
+            "payload": payload,
+        }
+    return payload
+
+
+def result_context_period(conn, shop_id, date_from, date_to) -> dict:
+    try:
+        batch = ai_digest.fetch_review_batch(conn, shop_id, date_from, date_to)
+    except ai_digest.DigestError:
+        return {"from": date_from, "to": date_to}
+    return {"from": batch["period"]["from"], "to": batch["period"]["to"],
+            "stats": batch["stats"], "previous_stats": batch["previous_stats"],
+            "input_truncated": batch["truncated"]}
 
 
 # Static dashboard -- mounted last so API routes take priority.
